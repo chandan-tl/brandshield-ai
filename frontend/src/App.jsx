@@ -3,10 +3,28 @@ import { reviewContent, reviewAI } from "./services/api";
 import "./App.css";
 
 const APPROVAL_STORAGE_KEY = "brandshield_approval_records";
+const REVIEW_HISTORY_KEY = "brandshield_review_history_v1";
+const MAX_REVIEW_HISTORY = 30;
+
+function readReviewHistory() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(REVIEW_HISTORY_KEY) || "[]");
+        return Array.isArray(saved) ? saved : [];
+    } catch (error) {
+        console.warn("Could not read review history:", error);
+        return [];
+    }
+}
+
+function createReviewId() {
+    return globalThis.crypto?.randomUUID?.() || `review-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function App() {
     const [brandName, setBrandName] = useState("My Brand");
     const [brandTone, setBrandTone] = useState("Professional");
+    const [targetAudience, setTargetAudience] = useState("General consumers");
+    const [contentType, setContentType] = useState("Social media post");
     const [restrictedWords, setRestrictedWords] = useState("cheap, guaranteed, fake");
     const [preferredTerms, setPreferredTerms] = useState("cheap:affordable, buy:discover");
     const [approvedFacts, setApprovedFacts] = useState("Founded in 2020");
@@ -20,11 +38,14 @@ function App() {
 
     const [approvalConfirmed, setApprovalConfirmed] = useState(false);
     const [approvalRecord, setApprovalRecord] = useState(null);
+    const [reviewHistory, setReviewHistory] = useState(readReviewHistory);
 
     function getBrandRules() {
         return {
             brandName: brandName.trim() || "Unnamed brand",
             brandTone,
+            targetAudience: targetAudience.trim() || "Not specified",
+            contentType,
             restrictedWords: restrictedWords
                 .split(",")
                 .map((word) => word.trim())
@@ -57,6 +78,101 @@ function App() {
         setError("");
     }
 
+    function saveHistoryRecord(record) {
+        const current = readReviewHistory();
+        const next = [record, ...current.filter((item) => item.id !== record.id)]
+            .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+            .slice(0, MAX_REVIEW_HISTORY);
+
+        try {
+            localStorage.setItem(REVIEW_HISTORY_KEY, JSON.stringify(next));
+            setReviewHistory(next);
+            return true;
+        } catch (storageError) {
+            console.error("Could not save review history:", storageError);
+            setError("This review is available now, but browser storage could not save it to history.");
+            return false;
+        }
+    }
+
+    function updateHistoryRecord(id, changes) {
+        if (!id) return;
+        const current = readReviewHistory();
+        const next = current.map((item) =>
+            item.id === id ? { ...item, ...changes, updatedAt: new Date().toISOString() } : item
+        );
+        try {
+            localStorage.setItem(REVIEW_HISTORY_KEY, JSON.stringify(next));
+            setReviewHistory(next);
+        } catch (storageError) {
+            console.error("Could not update review history:", storageError);
+            setError("The review changed, but browser storage could not update its history record.");
+        }
+    }
+
+    function handleViewHistory(record) {
+        if (!record) return;
+        const savedRules = record.brandRules || {};
+        setBrandName(savedRules.brandName || "My Brand");
+        setBrandTone(savedRules.brandTone || "Professional");
+        setTargetAudience(savedRules.targetAudience || "Not specified");
+        setContentType(savedRules.contentType || "Social media post");
+        setRestrictedWords(Array.isArray(savedRules.restrictedWords)
+            ? savedRules.restrictedWords.join(", ")
+            : "");
+        setPreferredTerms(Array.isArray(savedRules.preferredTerms)
+            ? savedRules.preferredTerms.map((item) => `${item.term || ""}:${item.preferred || ""}`).join(", ")
+            : "");
+        setApprovedFacts(Array.isArray(savedRules.approvedFacts)
+            ? savedRules.approvedFacts.join("\n")
+            : "");
+        setContent(record.originalContent || "");
+        setResults({
+            historyId: record.id,
+            originalContent: record.originalContent || "",
+            brandRules: savedRules,
+            ruleResults: record.ruleResults || { status: "Reviewed", totalIssues: 0, issues: [] },
+            aiResults: record.aiResults || null,
+        });
+        setReviewedRules(savedRules);
+        setApprovalConfirmed(false);
+        setApprovalRecord(record.approvalStatus === "Approved"
+            ? {
+                brandName: record.brandName || record.brandRules?.brandName || brandName,
+                approvedAt: record.approvedAt,
+                savedLocally: true,
+                historical: true,
+            }
+            : null);
+        setError("");
+        window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    function handleDeleteHistory(id) {
+        const next = readReviewHistory().filter((item) => item.id !== id);
+        try {
+            localStorage.setItem(REVIEW_HISTORY_KEY, JSON.stringify(next));
+            setReviewHistory(next);
+            if (results?.historyId === id) setApprovalRecord(null);
+        } catch (storageError) {
+            console.error("Could not delete review history:", storageError);
+            setError("Could not delete this history record from browser storage.");
+        }
+    }
+
+    function handleRevokeHistoryApproval(record) {
+        if (!record?.id) return;
+        updateHistoryRecord(record.id, {
+            approvalStatus: "Pending Review",
+            approvedAt: null,
+            approvalAcknowledgement: null,
+        });
+        if (results?.historyId === record.id) {
+            setApprovalRecord(null);
+            setApprovalConfirmed(false);
+        }
+    }
+
     async function runReview(contentToReview, rules = getBrandRules()) {
         const submittedContent = contentToReview.trim();
 
@@ -76,12 +192,26 @@ function App() {
         try {
             // First return fast deterministic findings to the dashboard.
             const ruleData = await reviewContent(submittedContent, rules);
+            const historyId = createReviewId();
             const initialResults = {
+                historyId,
                 originalContent: submittedContent,
                 brandRules: rules,
                 ruleResults: ruleData.ruleResults,
                 aiResults: null,
             };
+
+            saveHistoryRecord({
+                id: historyId,
+                brandName: rules.brandName || "Unnamed brand",
+                originalContent: submittedContent,
+                brandRules: rules,
+                ruleResults: ruleData.ruleResults,
+                aiResults: null,
+                approvalStatus: "Pending Review",
+                createdAt: new Date().toISOString(),
+                approvedAt: null,
+            });
 
             setResults(initialResults);
             setLoading(false);
@@ -95,26 +225,27 @@ function App() {
                     ruleData.ruleResults
                 );
 
+                updateHistoryRecord(historyId, { aiResults: aiData.aiResults });
                 setResults((current) => {
-                    if (!current || current.originalContent !== submittedContent) {
+                    if (!current || current.historyId !== historyId) {
                         return current;
                     }
                     return { ...current, aiResults: aiData.aiResults };
                 });
             } catch (aiError) {
+                const unavailableResult = {
+                    available: false,
+                    summary: "AI analysis could not be completed. Rule-based results are still available.",
+                    error: aiError.message,
+                    recommendations: [],
+                    claimVerification: [],
+                };
+                updateHistoryRecord(historyId, { aiResults: unavailableResult });
                 setResults((current) => {
-                    if (!current || current.originalContent !== submittedContent) {
+                    if (!current || current.historyId !== historyId) {
                         return current;
                     }
-                    return {
-                        ...current,
-                        aiResults: {
-                            available: false,
-                            summary: "AI analysis could not be completed. Rule-based results are still available.",
-                            error: aiError.message,
-                            recommendations: [],
-                        },
-                    };
+                    return { ...current, aiResults: unavailableResult };
                 });
             } finally {
                 setAiLoading(false);
@@ -145,21 +276,22 @@ function App() {
                 results.ruleResults
             );
 
+            updateHistoryRecord(results.historyId, { aiResults: aiData.aiResults });
             setResults((current) => current
                 ? { ...current, aiResults: aiData.aiResults }
                 : current
             );
         } catch (retryError) {
+            const unavailableResult = {
+                available: false,
+                summary: "AI analysis could not be completed.",
+                error: retryError.message,
+                recommendations: [],
+                claimVerification: [],
+            };
+            updateHistoryRecord(results.historyId, { aiResults: unavailableResult });
             setResults((current) => current
-                ? {
-                    ...current,
-                    aiResults: {
-                        available: false,
-                        summary: "AI analysis could not be completed.",
-                        error: retryError.message,
-                        recommendations: [],
-                    },
-                }
+                ? { ...current, aiResults: unavailableResult }
                 : current
             );
         } finally {
@@ -202,6 +334,13 @@ function App() {
                 APPROVAL_STORAGE_KEY,
                 JSON.stringify([record, ...records].slice(0, 25))
             );
+            if (results.historyId) {
+                updateHistoryRecord(results.historyId, {
+                    approvalStatus: "Approved",
+                    approvedAt: record.approvedAt,
+                    approvalAcknowledgement: record.acknowledgement,
+                });
+            }
             setApprovalRecord({ ...record, savedLocally: true });
         } catch (storageError) {
             console.error("Could not save the approval record:", storageError);
@@ -309,6 +448,45 @@ function App() {
                                 <option>Innovative</option>
                                 <option>Playful</option>
                             </select>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="target-audience">Target Audience</label>
+                            <input
+                                id="target-audience"
+                                value={targetAudience}
+                                maxLength={180}
+                                disabled={loading || aiLoading}
+                                onChange={(event) => {
+                                    setTargetAudience(event.target.value);
+                                    invalidateReview();
+                                }}
+                                placeholder="e.g. young professionals, parents, first-time buyers"
+                            />
+                            <small>Describe who this content is intended to reach.</small>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="content-type">Content Type</label>
+                            <select
+                                id="content-type"
+                                value={contentType}
+                                disabled={loading || aiLoading}
+                                onChange={(event) => {
+                                    setContentType(event.target.value);
+                                    invalidateReview();
+                                }}
+                            >
+                                <option>Social media post</option>
+                                <option>Advertisement</option>
+                                <option>Website copy</option>
+                                <option>Product description</option>
+                                <option>Email campaign</option>
+                                <option>Blog article</option>
+                                <option>Press release</option>
+                                <option>Landing page</option>
+                            </select>
+                            <small>Choose the format Gemini should consider during the review.</small>
                         </div>
 
                         <div className="form-group">
@@ -473,7 +651,7 @@ function App() {
                                         <div className="ai-loading" role="status">
                                             <div className="ai-spinner" />
                                             <p>Your rule checks are complete.</p>
-                                            <p>Gemini is analysing tone, context and marketing claims.</p>
+                                            <p>Gemini is analysing brand tone, target audience, content type and marketing claims.</p>
                                             <small>Your rule-based results are already available above.</small>
                                         </div>
                                     )}
@@ -503,6 +681,22 @@ function App() {
                                             </div>
 
                                             <div className="ai-block">
+                                                <h5>Target Audience Fit</h5>
+                                                <p>{results.aiResults.audienceFitAnalysis || "No audience-fit analysis was returned."}</p>
+                                                <small className="helper-text">
+                                                    Audience: {results.brandRules?.targetAudience || "Not specified"}
+                                                </small>
+                                            </div>
+
+                                            <div className="ai-block">
+                                                <h5>Content-Type Fit</h5>
+                                                <p>{results.aiResults.contentTypeAnalysis || "No content-type analysis was returned."}</p>
+                                                <small className="helper-text">
+                                                    Content type: {results.brandRules?.contentType || "Not specified"}
+                                                </small>
+                                            </div>
+
+                                            <div className="ai-block">
                                                 <h5>AI Findings</h5>
                                                 {results.aiResults.findings?.length ? (
                                                     results.aiResults.findings.map((finding, index) => (
@@ -522,6 +716,45 @@ function App() {
                                                     ))
                                                 ) : (
                                                     <p>No additional contextual issues identified.</p>
+                                                )}
+                                            </div>
+
+                                            <div className="ai-block">
+                                                <h5>Claim Verification Against Approved Facts</h5>
+                                                <p className="helper-text">
+                                                    Claims are compared only with the facts you supplied. This is not an independent fact-check.
+                                                </p>
+                                                {results.aiResults.claimVerification?.length ? (
+                                                    <div className="claim-verification-list">
+                                                        {results.aiResults.claimVerification.map((claim, index) => {
+                                                            const status = ["Supported", "Unsupported", "Requires Verification"].includes(claim.status)
+                                                                ? claim.status
+                                                                : "Requires Verification";
+                                                            const badgeStyle = status === "Supported"
+                                                                ? { background: "#e8f7ee", color: "#176b3a", border: "1px solid #b9e4c8" }
+                                                                : status === "Unsupported"
+                                                                    ? { background: "#fdecec", color: "#a12626", border: "1px solid #f3c1c1" }
+                                                                    : { background: "#fff6df", color: "#805b00", border: "1px solid #f0dfa8" };
+                                                            return (
+                                                                <article className="ai-finding" key={`claim-verification-${index}`}>
+                                                                    <div className="issue-top">
+                                                                        <strong>{claim.claim}</strong>
+                                                                        <span style={{ ...badgeStyle, display: "inline-block", padding: "4px 9px", borderRadius: "999px", fontSize: "12px", fontWeight: 700 }}>
+                                                                            {status}
+                                                                        </span>
+                                                                    </div>
+                                                                    {claim.supportingFact && <p><strong>Matching fact:</strong> {claim.supportingFact}</p>}
+                                                                    <p>{claim.explanation}</p>
+                                                                </article>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                ) : (
+                                                    <p>
+                                                        {results.brandRules?.approvedFacts?.length
+                                                            ? "No material factual claims were classified in this review."
+                                                            : "Add approved brand facts to enable claim comparison."}
+                                                    </p>
                                                 )}
                                             </div>
 
@@ -642,6 +875,61 @@ function App() {
                         )}
                     </section>
                 </div>
+
+                <section className="card history-card" id="review-history" aria-labelledby="history-heading">
+                    <div className="card-heading">
+                        <div>
+                            <span className="section-label">REVIEW MANAGEMENT</span>
+                            <h3 id="history-heading">Review History & Approval Status</h3>
+                        </div>
+                        <span className="card-icon">◷</span>
+                    </div>
+                    <p className="helper-text">
+                        Reviews are saved in this browser only. They are not shared across devices or team members.
+                    </p>
+                    {reviewHistory.length ? (
+                        <div className="history-list" style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                            {reviewHistory.map((record) => (
+                                <article className="history-item" key={record.id} style={{ border: "1px solid #e4e7ec", borderRadius: "10px", padding: "14px" }}>
+                                    <div className="history-item-main">
+                                        <div className="issue-top">
+                                            <strong>{record.brandName || "Unnamed brand"}</strong>
+                                            <span className={record.approvalStatus === "Approved" ? "severity low" : "severity medium"}>
+                                                {record.approvalStatus || "Pending Review"}
+                                            </span>
+                                        </div>
+                                        <p className="history-preview">
+                                            {(record.originalContent || "").replace(/\s+/g, " ").slice(0, 180)}
+                                            {(record.originalContent || "").length > 180 ? "…" : ""}
+                                        </p>
+                                        <small className="helper-text">
+                                            {record.createdAt ? new Date(record.createdAt).toLocaleString() : "Date unavailable"}
+                                            {` · ${record.ruleResults?.totalIssues ?? 0} rule issue(s)`}
+                                            {record.aiResults?.available && Number.isFinite(Number(record.aiResults.complianceScore))
+                                                ? ` · AI score ${record.aiResults.complianceScore}/100`
+                                                : " · AI result unavailable"}
+                                        </small>
+                                    </div>
+                                    <div className="history-actions" style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "10px" }}>
+                                        <button className="secondary-button" type="button" onClick={() => handleViewHistory(record)}>
+                                            View Review
+                                        </button>
+                                        {record.approvalStatus === "Approved" && (
+                                            <button className="secondary-button" type="button" onClick={() => handleRevokeHistoryApproval(record)}>
+                                                Reopen Approval
+                                            </button>
+                                        )}
+                                        <button className="secondary-button" type="button" onClick={() => handleDeleteHistory(record.id)}>
+                                            Delete
+                                        </button>
+                                    </div>
+                                </article>
+                            ))}
+                        </div>
+                    ) : (
+                        <p className="success-message">No saved reviews yet. Complete a content analysis to create the first history record.</p>
+                    )}
+                </section>
 
                 <footer className="footer">
                     BrandShield AI © 2026 | Every piece of content. One trusted brand.
